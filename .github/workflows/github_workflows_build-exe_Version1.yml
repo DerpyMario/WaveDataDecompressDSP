@@ -1,0 +1,29 @@
+name: Build Windows EXE
+
+on:
+  push:
+    paths:
+      - 'kss_dsp_extract.c'
+      - '.github/workflows/**'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build kss_dsp_extract.exe (x86_64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64
+
+      - name: Compile (x86_64-w64-mingw32)
+        run: |
+          x86_64-w64-mingw32-gcc -O2 -static -o kss_dsp_extract.exe kss_dsp_extract.c
+
+      - name:
