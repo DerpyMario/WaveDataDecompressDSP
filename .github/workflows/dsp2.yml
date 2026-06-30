@@ -32,7 +32,7 @@ jobs:
           x86_64-w64-mingw32-gcc -std=c11 -O2 -static -o RockmanFilePack.exe pactool.c
 
       - name: Upload Artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: Windows-EXE-x86_64
           path: |
