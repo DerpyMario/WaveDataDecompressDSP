@@ -3,9 +3,15 @@
  *
  * Handles two formats:
  *
- * 1. KSS Wave/BGM/SE Link Data (Konami GameCube archive trio: WaveData.bin,
- *    BgmData.bin, SeData.bin — magic strings "KSS Wave Link Data",
- *    "KSS BGM Link Data", "KSS SE Link Data", all dated 08/28/2002)
+ * 1. KSS Wave/BGM/SE Link Data — Disney Sports: Soccer (GameCube, 2002),
+ *    Konami's in-house audio archive trio: WaveData.bin, BgmData.bin,
+ *    SeData.bin (magic strings "KSS Wave Link Data", "KSS BGM Link Data",
+ *    "KSS SE Link Data", all dated 08/28/2002 — matching the game's 2002
+ *    release). NOT the TMNT3 strbgm.bin format described in mode 2 below;
+ *    the two were initially conflated since this tool started as an
+ *    upgrade of a TMNT3-specific extractor, but the byte layouts are
+ *    unrelated beyond both using GameCube DSP-ADPCM as the underlying
+ *    sample codec.
  *
  *    WaveData.bin layout
  *    ────────────────────
@@ -74,12 +80,19 @@
  *        parameters). It is left unparsed rather than guessed at.
  *      - No public documentation for this exact "KSS ... Link Data" format
  *        was found (searched general web, vgmstream's source/format list,
- *        and the hcs64 forum). A related, separately-documented case was
- *        found, though: a 2018 hcs64 forum thread describes Konami GC/Wii
- *        "Power Pro" .vas archives as DSP-shaped but headerless, with the
- *        same "can't cleanly recover per-stream coefficients" problem —
- *        suggesting this is a recurring trait of Konami's GC audio tooling
- *        from this era rather than a mistake in this analysis.
+ *        and hcs64.com's tool list — fetched in full directly, including
+ *        the page hosting the original TMNT3 extractor this tool started
+ *        from; it has no Disney Sports or "KSS" entry). A closely related,
+ *        independently-documented case turned up, though: a 2018 hcs64
+ *        forum thread describes Konami's later GC/Wii "Power Pro" .vas
+ *        archives the same way — DSP-shaped audio with no way to recover
+ *        per-stream coefficients, the archive itself "headerless." That
+ *        same pattern (real per-stream coefficients normally required by
+ *        DSP-ADPCM, but genuinely absent from the shipped data files) shows
+ *        up repeatedly across other publicly-discussed "headerless"
+ *        Konami/PS2-engine ports too, which is why this tool now treats it
+ *        as an expected property of this codebase's tooling rather than a
+ *        bug in this analysis.
  *    Given this, every .dsp this tool writes uses safe placeholder
  *    coefficients (all zero, via make_dsp_hdr()'s NULL-sub path) rather
  *    than fabricated values. The split boundaries, sample/nibble counts,
@@ -719,7 +732,7 @@ int main(int argc, char *argv[])
 
     printf("===========================================\n");
     printf("  GameCube DSP Extractor v2.0\n");
-    printf("  KSS Wave Link Data / TMNT3 strbgm.bin\n");
+    printf("  Disney Sports: Soccer 'KSS ... Link Data' / TMNT3 strbgm.bin\n");
     printf("===========================================\n");
     printf("Input: %s\n", inpath);
     if (interleave_bgm)
