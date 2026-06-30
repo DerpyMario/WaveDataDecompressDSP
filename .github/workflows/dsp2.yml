@@ -2,35 +2,39 @@ name: Build Windows EXE
 
 on:
   push:
-    branches: ["main"]
+    paths:
+      - 'kss_dsp_extract.c'
+      - 'pactool.c'
+      - '.github/workflows/**'
   pull_request:
-    branches: ["main"]
+  workflow_dispatch:
 
 jobs:
-  build-exe:
-    name: Build kss_dsp_extract.exe (cross-compile on Ubuntu)
+  build:
+    name: Build kss_dsp_extract.exe & RockmanFilePack.exe (x86_64)
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install mingw-w64 (cross-compiler)
+      - name: Install mingw-w64
         run: |
           sudo apt-get update
           sudo apt-get install -y mingw-w64
 
-      - name: Compile kss_dsp_extract.c -> kss_dsp_extract.exe
+      - name: Compile kss_dsp_extract.exe (x86_64-w64-mingw32)
         run: |
-          x86_64-w64-mingw32-gcc -O2 -o kss_dsp_extract.exe kss_dsp_extract.c
+          x86_64-w64-mingw32-gcc -O2 -static -o kss_dsp_extract.exe kss_dsp_extract.c
 
-      - name: Show artifact info
+      - name: Compile pactool.c to RockmanFilePack.exe (x86_64-w64-mingw32)
         run: |
-          echo "Built files:"
-          ls -lh kss_dsp_extract.exe || true
+          x86_64-w64-mingw32-gcc -std=c11 -O2 -static -o RockmanFilePack.exe pactool.c
 
-      - name: Upload built EXE
-        uses: actions/upload-artifact@v4
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v3
         with:
-          name: kss_dsp_extract-exe
-          path: kss_dsp_extract.exe
+          name: Windows-EXE-x86_64
+          path: |
+            kss_dsp_extract.exe
+            RockmanFilePack.exe
