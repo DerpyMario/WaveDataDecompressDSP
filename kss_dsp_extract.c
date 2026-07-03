@@ -205,31 +205,67 @@ static void wb16(unsigned v, unsigned char *p)
 }
 
 /* ------------------------------------------------------------------ */
-/*  DSP sub-block / header utilities                                    */
+/*  DSP header construction                                             */
 /* ------------------------------------------------------------------ */
-
-/* A valid sub-block has first 8 bytes == 0 and a plausible nibble count. */
-static int valid_sub(const unsigned char *s)
-{
-    int i;
-    for (i = 0; i < 8; i++) if (s[i]) return 0;
-    unsigned n = rb32(s + 8);
-    return n > 0 && n < 0x40000000u;
-}
 
 /*
  * Build a standard 0x60-byte GameCube DSP header.
- *   mono_sz : bytes of mono audio data (per channel, after de-interleave)
- *   sub     : optional 0x40-byte sub-block; placed at DSP bytes [0x0C..0x4B]
- *             (covers loop flags, loop points, ca, coefficients, ps, yn, etc.)
- *             Pass NULL to fill those fields with safe defaults.
+ *
+ *   mono_sz : bytes of mono ADPCM audio data that will follow the header
+ *   audio   : pointer to that audio data (must be readable for at least
+ *             1 byte when mono_sz > 0) — needed to set initial_ps correctly,
+ *             see note below
  *   srate   : sample rate in Hz
- *   loop_s  : loop start nibbles (only used when sub == NULL)
- *   loop_e  : loop end nibbles   (only used when sub == NULL; 0 = no loop)
+ *   loop_s  : loop start nibbles (0 if not looping)
+ *   loop_e  : loop end nibbles   (0 = not looping)
+ *
+ * *** Two fields here matter more than they might look, and getting either
+ * wrong makes real decoders (vgmstream, and anything built on it, including
+ * foobar2000's vgmstream plugin) outright REJECT the file as "unsupported
+ * format" rather than just mis-decoding it. Confirmed directly against
+ * vgmstream's own validation source (src/meta/ngc_dsp_std.c,
+ * read_dsp_header_endian()), not inferred:
+ *
+ * 1. initial_ps (header offset 0x3E) must equal the actual first byte of
+ *    the audio data that follows. That byte packs the first ADPCM frame's
+ *    predictor index (high nibble) and scale exponent (low nibble) — the
+ *    header field is a redundant, must-match copy of it, and vgmstream
+ *    hard-fails (`goto fail`) on any mismatch:
+ *        if (header.initial_ps != read_u8(start_offset,sf)) goto fail;
+ *    This is real, already-known-correct data (it's a byte that's
+ *    genuinely present in the audio stream being written), not a guess —
+ *    so this part of the header is fully accurate regardless of the
+ *    coefficient situation below.
+ *
+ * 2. Coefficients (offset 0x1C, 16 × int16) must not be all zero.
+ *    vgmstream counts zero entries and hard-fails if all 16 are zero:
+ *        if (zero_coefs == 16) goto fail;
+ *    An earlier revision of this tool used all-zero coefficients as an
+ *    "honest placeholder" for the real per-stream values this format
+ *    doesn't ship (see the top-of-file note on the missing coefficient
+ *    search) — which is exactly what triggered this rejection on every
+ *    extracted file. Since the true coefficients aren't recoverable from
+ *    the data provided, this now uses a fixed, clearly-synthetic non-zero
+ *    substitute instead: 8 pairs of (2048, 0), i.e. Q11-fixed-point
+ *    (1.0, 0.0) — a first-order "predict next sample = previous sample"
+ *    predictor. It's stable (no risk of the runaway feedback a wrong
+ *    *unstable* coefficient pair could cause) and passes vgmstream's
+ *    check, but it is NOT the game's real coefficients: decoded audio
+ *    will have audible quantization noise/distortion beyond what the
+ *    original encoder intended, since scale values in the stream were
+ *    chosen assuming the real (unknown) predictor, not this generic one.
+ *    In short: after this fix, files PLAY; they do not yet sound fully
+ *    correct. Replace COEF_PLACEHOLDER below if real coefficients are
+ *    ever found.
  */
+static const int16_t COEF_PLACEHOLDER[16] = {
+    2048, 0,  2048, 0,  2048, 0,  2048, 0,
+    2048, 0,  2048, 0,  2048, 0,  2048, 0,
+};
+
 static void make_dsp_hdr(unsigned char *hdr,
                           unsigned mono_sz,
-                          const unsigned char *sub,
+                          const unsigned char *audio,
                           unsigned srate,
                           unsigned loop_s,
                           unsigned loop_e)
@@ -243,31 +279,29 @@ static void make_dsp_hdr(unsigned char *hdr,
     wb32(nib,   hdr + 0x04);   /* num_nibbles  */
     wb32(srate, hdr + 0x08);   /* sample_rate  */
 
-    if (sub && valid_sub(sub)) {
-        /*
-         * Sub-block maps directly to DSP[0x0C..0x4B]:
-         *   sub[0x00] = DSP[0x0C] loop_flag high byte
-         *   sub[0x08] = DSP[0x14] loop_end
-         *   sub[0x10] = DSP[0x1C] first coefficient
-         *   sub[0x32] = DSP[0x3E] ps  …etc.
-         */
-        memcpy(hdr + 0x0C, sub, SUB_SZ);
-    } else {
-        /* Safe defaults: no loop, ADPCM format, ca=2, zero coefficients */
-        wb16(0, hdr + 0x0C);    /* loop_flag = 0 */
-        wb16(0, hdr + 0x0E);    /* format    = 0 (ADPCM) */
-        if (loop_e > 0) {
-            wb16(1, hdr + 0x0C);            /* loop_flag = 1 */
-            wb32(loop_s, hdr + 0x10);       /* loop_start  */
-            wb32(loop_e, hdr + 0x14);       /* loop_end    */
-        }
-        wb32(2, hdr + 0x18);    /* ca = 2 (standard ADPCM start) */
+    wb16(0, hdr + 0x0C);    /* loop_flag = 0 (set below if looping) */
+    wb16(0, hdr + 0x0E);    /* format    = 0 (ADPCM; vgmstream requires this exact value) */
+    if (loop_e > 0) {
+        wb16(1, hdr + 0x0C);            /* loop_flag = 1 */
+        wb32(loop_s, hdr + 0x10);       /* loop_start (nibbles) */
+        wb32(loop_e, hdr + 0x14);       /* loop_end   (nibbles) */
     }
+    wb32(2, hdr + 0x18);    /* ca = 2 (standard ADPCM start address) */
+
+    {
+        int i;
+        for (i = 0; i < 16; i++)
+            wb16((unsigned)(uint16_t)COEF_PLACEHOLDER[i], hdr + 0x1C + i * 2);
+    }
+    wb16(0, hdr + 0x3C);    /* gain = 0 (vgmstream requires this exact value) */
+
+    /* initial_ps: must equal the real first audio byte -- see note above. */
+    if (mono_sz > 0 && audio != NULL)
+        wb16(audio[0], hdr + 0x3E);
 }
 
 /* Write a single-channel .dsp file (header + raw ADPCM audio). */
 static int write_dsp(const char *path,
-                      const unsigned char *sub,
                       unsigned mono_sz,
                       const unsigned char *audio,
                       unsigned srate,
@@ -275,7 +309,7 @@ static int write_dsp(const char *path,
                       unsigned loop_e)
 {
     unsigned char h[DSP_HDR_SZ];
-    make_dsp_hdr(h, mono_sz, sub, srate, loop_s, loop_e);
+    make_dsp_hdr(h, mono_sz, audio, srate, loop_s, loop_e);
 
     FILE *f = fopen(path, "wb");
     if (!f) { perror(path); return 0; }
