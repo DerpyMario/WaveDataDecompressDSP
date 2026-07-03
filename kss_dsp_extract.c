@@ -1,5 +1,9 @@
 /*
- * kss_dsp_extract.c  –  GameCube DSP extractor v2.0
+ * kss_dsp_extract.c  –  GameCube DSP extractor v2.1
+ *
+ * Default behavior extracts SOUND EFFECTS from WaveData.bin. BGM music
+ * extraction is available but opt-in (pass --bgm) — earlier revisions of
+ * this tool extracted both by default, which was more than was wanted.
  *
  * Handles two formats:
  *
@@ -46,14 +50,43 @@
  *    is kept for other KSS-format files that may genuinely interleave (see
  *    write_stereo_pair()), but it is NOT exercised by default.
  *
- *    SE table (at se_table_offset)
- *    ──────────────────────────────
- *    12-byte entries, terminated when the constant field ≠ 0xFC1A7F00.
- *      [0x00-0x03] audio_offset (absolute file offset; 0 = null/silence)
- *      [0x04-0x07] 0xFC1A7F00  (constant marker)
- *      [0x08-0x0B] 0x00001F14  (constant; verified identical across all
- *                              672 entries in the reference file — not
- *                              loop data or anything per-entry.)
+ *    SE table — located by content, NOT by the header field
+ *    ─────────────────────────────────────────────────────
+ *    12-byte entries: [audio_offset:4][0xFC1A7F00:4][0x00001F14:4], the
+ *    last two fields constant across every entry (verified, not loop data
+ *    or anything else per-entry).
+ *
+ *    *** CORRECTED FINDING: the header field at 0x28 (0x00003800 in the
+ *    reference file) is NOT the table's start offset, despite an earlier
+ *    revision of this tool assuming so (and naming it se_table_offset).
+ *    The table's true, content-verified extent is 1026 entries (1015 with
+ *    real non-null audio addresses) running from file offset 0x2768 to
+ *    0x5780 — but 0x3800 lands on entry #354 of that table, roughly a
+ *    third of the way in, not entry #0. Because entries #354 onward still
+ *    match the expected 12-byte record shape perfectly, parsing forward
+ *    from 0x3800 alone gave no signal that anything was missing: it just
+ *    silently produced a table 354 entries short (350 of them real audio),
+ *    a ~35% undercount of actual sound effects. This was only caught by
+ *    scanning the raw bytes for the record's exact 8-byte marker
+ *    independent of any header field, and noticing the match run actually
+ *    starts much earlier. find_se_table() now does exactly that scan
+ *    instead of trusting the header, and is what this tool actually uses.
+ *    The header field's real meaning is unconfirmed — it is printed at
+ *    runtime for reference but no longer used operationally.
+ *
+ *    Between the end of the BGM table (~0x118) and the true SE table start
+ *    (0x2768) sits a separate, still only partly understood structure —
+ *    roughly 350 entries of its own, also on a 12-byte stride, holding a
+ *    monotonically increasing value per entry rather than a file offset.
+ *    It does NOT contain additional audio (no entry in it resembles a
+ *    valid file pointer into the wave area) and does NOT look like ADPCM
+ *    coefficients either — real per-stream LPC coefficients vary based on
+ *    each frame's signal content and would not be smoothly monotonic the
+ *    way every value in this structure is. The more likely explanation is
+ *    some kind of cumulative seek/timing table, but this is a hypothesis,
+ *    not a verified conclusion — it is left unparsed and unused rather
+ *    than guessed at further.
+ *
  *    SE audio size = distance to next occupied boundary in the file.
  *
  *    *** ADPCM COEFFICIENTS: NOT FOUND — extracted audio is NOT bit-exact ***
@@ -65,7 +98,9 @@
  *    2002, "SE Sound Call Label ... For PlayStation2(EE/IOP)") shows this
  *    audio system originated on PS2. A real per-stream coefficient table
  *    is expected to exist somewhere, but it was not found in any of the
- *    three data files supplied:
+ *    three data files supplied, including the not-yet-decoded structure
+ *    described just above (ruled out for the monotonicity reason given
+ *    there) and SeData.bin's own internal table (see below):
  *      - No header sits before any audio block in WaveData.bin itself
  *        (checked exhaustively, not just spot-checked).
  *      - BgmData.bin ("KSS BGM Link Data") is almost entirely zero-filled;
@@ -93,16 +128,23 @@
  *        Konami/PS2-engine ports too, which is why this tool now treats it
  *        as an expected property of this codebase's tooling rather than a
  *        bug in this analysis.
- *    Given this, every .dsp this tool writes uses safe placeholder
- *    coefficients (all zero, via make_dsp_hdr()'s NULL-sub path) rather
- *    than fabricated values. The split boundaries, sample/nibble counts,
- *    and raw ADPCM payload bytes are correct and verified; only the
- *    coefficients needed for a player to decode that payload back to
- *    correct-sounding PCM are missing. If you can locate the real
- *    coefficients (e.g. in the game's executable, or from someone with
- *    matching dsptool encoder output), patch them into make_dsp_hdr()'s
- *    coefficient slots (DSP header bytes 0x1C-0x3B) before relying on
- *    these files for anything beyond re-splitting/re-bundling raw data.
+ *    Given all this, the most likely remaining explanation is that
+ *    coefficients for this title are baked into the game's executable
+ *    (shared/global across streams, or selected by an in-memory table this
+ *    tool has no access to) rather than shipped in any of these three data
+ *    files — consistent with the format saving the per-clip header space
+ *    a normal .dsp file would spend on them. Confirming that would need
+ *    the game's DOL/executable, which was not provided here.
+ *    Every .dsp this tool writes uses safe placeholder coefficients (all
+ *    zero, via make_dsp_hdr()'s NULL-sub path) rather than fabricated
+ *    values. The split boundaries, sample/nibble counts, and raw ADPCM
+ *    payload bytes are correct and verified; only the coefficients needed
+ *    for a player to decode that payload back to correct-sounding PCM are
+ *    missing. If you can locate the real coefficients (e.g. by dumping the
+ *    game executable and searching it, or from someone with matching
+ *    dsptool encoder output), patch them into make_dsp_hdr()'s coefficient
+ *    slots (DSP header bytes 0x1C-0x3B) before relying on these files for
+ *    anything beyond re-splitting/re-bundling raw data.
  *
  * 2. Legacy TMNT3 scan mode (original strbgm.bin from TMNT3 "Mutant Nightmare")
  *    Scans at 0x800-aligned offsets for entries whose second uint32 == 32000.
@@ -112,14 +154,16 @@
  *    KSS Wave Link Data mode above is missing coefficients.
  *
  * Usage:
- *   kss_dsp_extract [input_file] [output_prefix] [--interleave-bgm]
+ *   kss_dsp_extract [input_file] [output_prefix] [--bgm] [--interleave-bgm]
  *
  *   Defaults: WaveData.bin, "tmnt3mn"
- *   --interleave-bgm: opt-in, see BGM entry table note above.
+ *   --bgm:            opt-in, also extract BGM music (default is SE-only)
+ *   --interleave-bgm: opt-in, only meaningful with --bgm; see BGM entry
+ *                     table note above.
  *
  * Output:
- *   KSS mode:   bgmNN.dsp + bgmNN_secondary.dsp (or bgmNNL/R.dsp with
- *               --interleave-bgm), seNNN.dsp
+ *   KSS mode:   seNNNN.dsp (always); with --bgm, also bgmNN.dsp +
+ *               bgmNN_secondary.dsp (or bgmNNL/R.dsp with --interleave-bgm)
  *   TMNT3 mode: prefixNNNNL.dsp / prefixNNNNR.dsp
  *
  * Build:
@@ -327,23 +371,91 @@ static unsigned next_boundary(const unsigned *arr, int n, unsigned key, unsigned
     return lo < n ? arr[lo] : fallback;
 }
 
+/*
+ * Locate the true SE table by content, not by trusting the file header.
+ *
+ * The header field at offset 0x28 was originally assumed to be the SE
+ * table's start offset (it was even named se_table_offset in an earlier
+ * revision of this tool). Verification against the reference WaveData.bin
+ * disproved that: the table's real, content-verified extent is 1026
+ * consecutive 12-byte entries, but the header field points to entry #354
+ * of that table — roughly a third of the way in — not entry #0. Trusting
+ * it silently dropped 354 entries (350 of them real, non-null audio),
+ * a ~35% undercount of actual sound effects.
+ *
+ * This function instead scans for the exact 8-byte per-entry marker
+ * (SE_C1_MAGIC immediately followed by SE_C2_MAGIC) at every byte
+ * position in [search_start, search_end), takes the first match as the
+ * table's first entry, then walks forward in fixed 12-byte steps for as
+ * long as that same 8-byte marker keeps matching. Because the marker is
+ * 8 essentially-arbitrary bytes, this run continuing correctly for over
+ * a thousand consecutive 12-byte-strided entries is not a plausible
+ * coincidence — it is a reliable signature of the real table, independent
+ * of any (possibly mislabeled) header field.
+ *
+ * Returns 1 and sets *out_start / *out_count on success, 0 if no marker
+ * occurrence was found at all in the search range.
+ */
+static int find_se_table(const unsigned char *data, long fsz,
+                          unsigned search_start, unsigned search_end,
+                          unsigned *out_start, int *out_count)
+{
+    unsigned char marker[8];
+    wb32(SE_C1_MAGIC, marker);
+    wb32(SE_C2_MAGIC, marker + 4);
+
+    if (search_end > (unsigned)fsz) search_end = (unsigned)fsz;
+    if (search_start + 8u > search_end) return 0;
+
+    unsigned pos = search_start;
+    unsigned first_match = 0;
+    int found = 0;
+    while (pos + 8u <= search_end) {
+        if (memcmp(data + pos, marker, 8) == 0) {
+            first_match = pos;
+            found = 1;
+            break;
+        }
+        pos++;
+    }
+    if (!found) return 0;
+
+    unsigned table_start = first_match - 4u;  /* addr field precedes the marker */
+
+    int count = 0;
+    unsigned off = table_start;
+    while (off + 12u <= (unsigned)fsz && memcmp(data + off + 4u, marker, 8) == 0) {
+        count++;
+        off += 12u;
+    }
+
+    *out_start = table_start;
+    *out_count = count;
+    return 1;
+}
+
 /* ================================================================== */
 /*  KSS Wave Link Data extraction                                       */
 /* ================================================================== */
-static void extract_kss(const unsigned char *data, long fsz, int interleave_bgm)
+static void extract_kss(const unsigned char *data, long fsz,
+                         int interleave_bgm, int write_bgm)
 {
-    unsigned se_tbl   = rb32(data + 0x28);
+    unsigned se_tbl_hdr = rb32(data + 0x28);
     unsigned wave_off = rb32(data + 0x2C);
     unsigned wave_sz  = rb32(data + 0x30);
 
     printf("KSS Wave Link Data\n");
-    printf("  SE table:    0x%08X\n", se_tbl);
+    printf("  Header field @0x28: 0x%08X  (NOT the SE table start -- see below)\n", se_tbl_hdr);
     printf("  Wave offset: 0x%08X   size: 0x%08X\n\n", wave_off, wave_sz);
 
     /* ============================================================ */
-    /*  BGM TRACKS                                                   */
+    /*  BGM TABLE                                                    */
+    /*  Always parsed (clip addresses are needed for the SE          */
+    /*  boundary list below regardless), but .dsp files are only     */
+    /*  written when write_bgm is set -- default is SE-only          */
+    /*  extraction. Pass --bgm to also get BGM clips.                */
     /* ============================================================ */
-    printf("=== BGM Tracks ===\n");
+    if (write_bgm) printf("=== BGM Tracks ===\n");
 
     /*
      * Collect all BGM L-channel absolute file offsets for the boundary
@@ -355,13 +467,13 @@ static void extract_kss(const unsigned char *data, long fsz, int interleave_bgm)
     int track = 0;
     unsigned tbl = 0x40u;
 
-    while (tbl + 8u <= se_tbl) {
+    while (tbl + 8u <= wave_off) {
         unsigned La = rb32(data + tbl);
         unsigned Ls = rb32(data + tbl + 4u);
         if (La == 0 && Ls == 0) break;
 
         /* Detect R-channel partner (next entry whose low byte == 0x01) */
-        int      has_R = (tbl + 16u <= se_tbl) &&
+        int      has_R = (tbl + 16u <= wave_off) &&
                          ((rb32(data + tbl + 8u) & 0xFFu) == 0x01u);
         unsigned Ra    = has_R ? (rb32(data + tbl + 8u) & 0xFFFFFF00u) : 0u;
         unsigned Rs    = has_R ? rb32(data + tbl + 12u)                 : 0u;
@@ -372,9 +484,18 @@ static void extract_kss(const unsigned char *data, long fsz, int interleave_bgm)
          */
         unsigned L_abs = (La == 0u) ? wave_off : La;
 
-        /* Register in the boundary list (used later for SE size calculation) */
+        /* Register in the boundary list (used later for SE size calculation).
+         * This always happens, even when write_bgm is off, since SE size
+         * computation still needs to know where BGM clips sit in the file. */
         if (La != 0u && bgm_addr_n < 128)
             bgm_addrs[bgm_addr_n++] = L_abs;
+
+        if (!write_bgm) {
+            /* SE-only mode: skip writing/printing, just move to the next entry. */
+            tbl += has_R ? 16u : 8u;
+            track++;
+            continue;
+        }
 
         printf("BGM %02d: main@0x%08X  size=0x%08X", track, L_abs, Ls);
         if (has_R) printf("  secondary@0x%08X  size=0x%08X", Ra, Rs);
@@ -458,55 +579,63 @@ static void extract_kss(const unsigned char *data, long fsz, int interleave_bgm)
         tbl += has_R ? 16u : 8u;
         track++;
     }
-    printf("Extracted %d BGM track(s)\n", track);
+    if (write_bgm) printf("Extracted %d BGM track(s)\n\n", track);
 
     /* ============================================================ */
-    /*  SOUND EFFECTS                                                */
+    /*  SOUND EFFECTS  (default / primary extraction target)        */
     /* ============================================================ */
-    printf("\n=== Sound Effects ===\n");
+    printf("=== Sound Effects ===\n");
 
     /*
-     * Parse SE table: 12-byte entries until the marker fields stop matching.
-     * Fields: [audio_offset, 0xFC1A7F00, 0x00001F14]
-     * The third field was verified constant across every entry in the
-     * sample file, so it carries no per-entry data — it is checked here
-     * only to confirm the table is still aligned (catches corruption or
-     * a misidentified se_table_offset on other files).
+     * The file header's field at offset 0x28 does NOT mark the true SE
+     * table start. An earlier revision of this tool assumed it did (and
+     * named it se_table_offset) because starting a 12-byte-stride parse
+     * there happened to find 672 entries that all matched the expected
+     * [addr][0xFC1A7F00][0x00001F14] shape — a false positive caused by
+     * that field actually pointing to entry #354 of the table's true
+     * 1026 entries, i.e. partway in rather than at the start; every entry
+     * from there onward still matches the same repeating record shape,
+     * so nothing about that scan looked wrong from entry #354 onward.
+     * The 354 entries before it (350 with real, non-null audio) were
+     * silently missed as a result. This was only caught by scanning the
+     * file for the record's exact 8-byte marker independent of the
+     * header, and noticing the match run actually starts much earlier.
+     * The header field's true meaning is unconfirmed; it is printed
+     * above for reference but not used operationally here.
      */
-    typedef struct { unsigned addr; } SeEnt;
-    SeEnt *ses = (SeEnt *)malloc(4096u * sizeof(SeEnt));
-    if (!ses) { fprintf(stderr, "OOM\n"); return; }
+    unsigned se_tbl;
     int se_n = 0;
-    int c2_mismatches = 0;
+    if (!find_se_table(data, fsz, 0x118u, wave_off, &se_tbl, &se_n)) {
+        fprintf(stderr, "Could not locate the SE table by content scan -- "
+                         "this file's format may differ from the reference "
+                         "WaveData.bin. No SE files extracted.\n");
+        return;
+    }
+    printf("SE table found at 0x%08X: %d entries (located by scanning for the "
+           "record's exact byte signature, not by trusting the header)\n",
+           se_tbl, se_n);
 
+    typedef struct { unsigned addr; } SeEnt;
+    SeEnt *ses = (SeEnt *)malloc((size_t)se_n * sizeof(SeEnt));
+    if (!ses) { fprintf(stderr, "OOM\n"); return; }
     {
         unsigned off = se_tbl;
-        while (off + 12u <= wave_off && se_n < 4096) {
-            unsigned a  = rb32(data + off);
-            unsigned c1 = rb32(data + off + 4u);
-            unsigned c2 = rb32(data + off + 8u);
-            if (c1 != SE_C1_MAGIC) break;
-            if (c2 != SE_C2_MAGIC) c2_mismatches++;
-            ses[se_n].addr = a;
-            se_n++;
+        int i;
+        for (i = 0; i < se_n; i++) {
+            ses[i].addr = rb32(data + off);
             off += 12u;
         }
     }
-    printf("%d SE entries in table", se_n);
-    if (c2_mismatches)
-        printf("  (warning: %d entries had an unexpected marker field —"
-               " table layout may differ from the reference file)",
-               c2_mismatches);
-    printf("\n");
+    unsigned se_tbl_end = se_tbl + (unsigned)se_n * 12u;
 
     /*
      * Build a sorted list of all valid audio boundaries:
-     *   • Non-null SE addresses that fall inside the mid-area [se_tbl, wave_off)
-     *   • BGM L-channel addresses collected above
+     *   • Non-null SE addresses that fall inside the mid-area [se_tbl_end, wave_off)
+     *   • BGM main-clip addresses collected above
      * This lets us compute accurate per-SE sizes even when BGM blocks
      * and SE blocks are interleaved in the file.
      */
-    unsigned *bounds = (unsigned *)malloc((se_n + bgm_addr_n + 2u) * sizeof(unsigned));
+    unsigned *bounds = (unsigned *)malloc(((unsigned)se_n + (unsigned)bgm_addr_n + 2u) * sizeof(unsigned));
     if (!bounds) { fprintf(stderr, "OOM\n"); free(ses); return; }
     int nb = 0;
 
@@ -514,7 +643,7 @@ static void extract_kss(const unsigned char *data, long fsz, int interleave_bgm)
         int i;
         for (i = 0; i < se_n; i++) {
             unsigned a = ses[i].addr;
-            if (a >= se_tbl && a < wave_off)
+            if (a >= se_tbl_end && a < wave_off)
                 bounds[nb++] = a;
         }
         for (i = 0; i < bgm_addr_n; i++)
@@ -536,9 +665,9 @@ static void extract_kss(const unsigned char *data, long fsz, int interleave_bgm)
     {
         int i, valid = 0;
         for (i = 0; i < se_n; i++)
-            if (ses[i].addr >= se_tbl && ses[i].addr < wave_off)
+            if (ses[i].addr >= se_tbl_end && ses[i].addr < wave_off)
                 valid++;
-        printf("%d valid SE addresses in audio area\n\n", valid);
+        printf("%d valid (non-null, in-range) SE addresses\n\n", valid);
     }
 
     /*
@@ -553,20 +682,19 @@ static void extract_kss(const unsigned char *data, long fsz, int interleave_bgm)
 
             /* Skip null entries */
             if (a == 0u) {
-                printf("SE%03d: [null / silence]\n", i);
                 continue;
             }
 
             /* Skip entries outside the audio area (e.g. header-region refs) */
-            if (a < se_tbl || a >= wave_off) {
-                printf("SE%03d: @0x%08X  [skip: outside audio area]\n", i, a);
+            if (a < se_tbl_end || a >= wave_off) {
+                printf("SE%04d: @0x%08X  [skip: outside audio area]\n", i, a);
                 continue;
             }
 
             /* Compute size = distance to next boundary */
             unsigned sz = next_boundary(bounds, nb, a, wave_off) - a;
             if (sz == 0u) {
-                printf("SE%03d: @0x%08X  [skip: size = 0]\n", i, a);
+                printf("SE%04d: @0x%08X  [skip: size = 0]\n", i, a);
                 continue;
             }
             if ((unsigned long)a + sz > (unsigned long)fsz)
@@ -577,15 +705,13 @@ static void extract_kss(const unsigned char *data, long fsz, int interleave_bgm)
             make_dsp_hdr(h, sz, NULL, SRATE_DEFAULT, 0, 0);
 
             char name[64];
-            snprintf(name, sizeof(name), "se%03d.dsp", i);
+            snprintf(name, sizeof(name), "se%04d.dsp", i);
             FILE *f = fopen(name, "wb");
             if (!f) { perror(name); continue; }
             fwrite(h, 1, DSP_HDR_SZ, f);
             fwrite(data + a, 1, sz, f);
             fclose(f);
 
-            printf("SE%03d: @0x%08X  sz=0x%06X (%6u B)  -> %s\n",
-                   i, a, sz, sz, name);
             written++;
         }
     }
@@ -695,12 +821,15 @@ static void extract_tmnt3(const unsigned char *data, long fsz,
 static void print_usage(const char *argv0)
 {
     fprintf(stderr,
-        "Usage: %s [input_file] [output_prefix] [--interleave-bgm]\n"
+        "Usage: %s [input_file] [output_prefix] [--bgm] [--interleave-bgm]\n"
         "  input_file       Defaults to WaveData.bin\n"
         "  output_prefix    Used only in legacy TMNT3 scan mode; defaults to \"tmnt3mn\"\n"
-        "  --interleave-bgm Opt-in: de-interleave KSS BGM clips as 0x100-byte stereo\n"
-        "                   instead of the default flat-mono extraction (see source\n"
-        "                   comments above extract_kss() before using this).\n",
+        "  --bgm            Opt-in: also extract BGM music clips (default is\n"
+        "                   sound-effects-only extraction).\n"
+        "  --interleave-bgm Opt-in, only meaningful together with --bgm: de-interleave\n"
+        "                   KSS BGM clips as 0x100-byte stereo instead of the default\n"
+        "                   flat-mono extraction (see source comments above\n"
+        "                   extract_kss() before using this).\n",
         argv0);
 }
 
@@ -709,11 +838,14 @@ int main(int argc, char *argv[])
     const char *inpath = NULL;
     const char *prefix = NULL;
     int interleave_bgm = 0;
+    int write_bgm = 0;
     int i;
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--interleave-bgm") == 0) {
             interleave_bgm = 1;
+        } else if (strcmp(argv[i], "--bgm") == 0) {
+            write_bgm = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -731,12 +863,12 @@ int main(int argc, char *argv[])
     if (!prefix) prefix = "tmnt3mn";
 
     printf("===========================================\n");
-    printf("  GameCube DSP Extractor v2.0\n");
+    printf("  GameCube DSP Extractor v2.1\n");
     printf("  Disney Sports: Soccer 'KSS ... Link Data' / TMNT3 strbgm.bin\n");
     printf("===========================================\n");
     printf("Input: %s\n", inpath);
-    if (interleave_bgm)
-        printf("Mode:  --interleave-bgm (opt-in stereo de-interleave for BGM)\n");
+    printf("Mode:  %s%s\n", write_bgm ? "SE + BGM" : "SE only (default; pass --bgm for music too)",
+           interleave_bgm ? ", --interleave-bgm" : "");
     printf("\n");
 
     /* Read the entire file into memory */
@@ -756,7 +888,7 @@ int main(int argc, char *argv[])
 
     /* Dispatch on magic */
     if (fsz >= 18 && memcmp(data, "KSS Wave Link Data", 18) == 0) {
-        extract_kss(data, fsz, interleave_bgm);
+        extract_kss(data, fsz, interleave_bgm, write_bgm);
     } else if (fsz >= 17 && memcmp(data, "KSS BGM Link Data", 17) == 0) {
         printf("KSS BGM Link Data detected – no raw DSP audio to extract.\n");
     } else {
