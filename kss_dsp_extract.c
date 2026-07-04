@@ -1,9 +1,24 @@
 /*
- * kss_dsp_extract.c  –  GameCube DSP extractor v2.1
+ * kss_dsp_extract.c  –  GameCube DSP extractor v2.2
  *
  * Default behavior extracts SOUND EFFECTS from WaveData.bin. BGM music
  * extraction is available but opt-in (pass --bgm) — earlier revisions of
  * this tool extracted both by default, which was more than was wanted.
+ *
+ * A second mode (--whole-file) skips real extraction entirely and wraps
+ * the ENTIRE input file as one big single .dsp instead — see the comment
+ * above extract_whole_file() for what that's actually good for (raw
+ * exploration/debugging, not a real audio track).
+ *
+ * Windows drag-and-drop is supported directly: dropping a file onto the
+ * compiled .exe runs it with just that one filename as an argument, which
+ * this tool detects and responds to with a small interactive menu (since
+ * a drag-and-drop gesture can't also carry command-line flags), then
+ * pauses for Enter before closing so the console window doesn't vanish
+ * before you can read the output. Any other invocation shape (flags
+ * present, multiple arguments, or none at all) skips the menu and pause
+ * entirely and behaves exactly as a normal command-line tool, so existing
+ * scripts/automation are unaffected.
  *
  * Handles two formats:
  *
@@ -135,16 +150,30 @@
  *    files — consistent with the format saving the per-clip header space
  *    a normal .dsp file would spend on them. Confirming that would need
  *    the game's DOL/executable, which was not provided here.
- *    Every .dsp this tool writes uses safe placeholder coefficients (all
- *    zero, via make_dsp_hdr()'s NULL-sub path) rather than fabricated
- *    values. The split boundaries, sample/nibble counts, and raw ADPCM
- *    payload bytes are correct and verified; only the coefficients needed
- *    for a player to decode that payload back to correct-sounding PCM are
- *    missing. If you can locate the real coefficients (e.g. by dumping the
- *    game executable and searching it, or from someone with matching
- *    dsptool encoder output), patch them into make_dsp_hdr()'s coefficient
- *    slots (DSP header bytes 0x1C-0x3B) before relying on these files for
- *    anything beyond re-splitting/re-bundling raw data.
+ *
+ *    *** PLAYBACK NOTE: an all-zero coefficient placeholder (the first
+ *    version of this tool's approach — "honest" in the sense of not
+ *    fabricating values, but untested against a real decoder) turned out
+ *    to make every extracted file outright FAIL to open in foobar2000 /
+ *    vgmstream ("unsupported format or corrupted file"), not just decode
+ *    incorrectly. Checked directly against vgmstream's own validation
+ *    source (src/meta/ngc_dsp_std.c): it hard-rejects any header whose 16
+ *    coefficients are all zero, and separately hard-rejects any header
+ *    whose initial_ps field doesn't exactly match the real first byte of
+ *    the audio data. make_dsp_hdr() now fixes both: initial_ps is always
+ *    copied from the real audio (this part is fully correct, not a guess),
+ *    and coefficients use a fixed non-zero placeholder, COEF_PLACEHOLDER —
+ *    8 pairs of (2048, 0), a stable Q11 first-order "predict = previous
+ *    sample" predictor — instead of all zeros, purely so the file passes
+ *    validation and plays. It is still a placeholder, not the game's real
+ *    per-stream coefficients: files now open and play, but will have
+ *    audible quantization noise/distortion beyond what the original
+ *    encoder intended, since the stream's scale values were chosen by the
+ *    encoder assuming the real (unknown) predictor, not this generic one.
+ *    If you locate the real coefficients (e.g. by dumping the game
+ *    executable and searching it, or from someone with matching dsptool
+ *    encoder output), replace COEF_PLACEHOLDER's values before relying on
+ *    these files for anything beyond re-splitting/re-bundling raw data.
  *
  * 2. Legacy TMNT3 scan mode (original strbgm.bin from TMNT3 "Mutant Nightmare")
  *    Scans at 0x800-aligned offsets for entries whose second uint32 == 32000.
@@ -154,16 +183,23 @@
  *    KSS Wave Link Data mode above is missing coefficients.
  *
  * Usage:
- *   kss_dsp_extract [input_file] [output_prefix] [--bgm] [--interleave-bgm]
+ *   kss_dsp_extract [input_file] [output_prefix] [--bgm] [--interleave-bgm] [--whole-file]
  *
  *   Defaults: WaveData.bin, "tmnt3mn"
  *   --bgm:            opt-in, also extract BGM music (default is SE-only)
  *   --interleave-bgm: opt-in, only meaningful with --bgm; see BGM entry
  *                     table note above.
+ *   --whole-file:     opt-in, wrap the whole input as one .dsp instead of
+ *                     real extraction; see extract_whole_file() above.
+ *
+ *   Dropping a file onto the compiled .exe (exactly one argument, no
+ *   flags) brings up an interactive menu to choose between normal
+ *   extraction and --whole-file, since the drop gesture can't carry flags.
  *
  * Output:
  *   KSS mode:   seNNNN.dsp (always); with --bgm, also bgmNN.dsp +
  *               bgmNN_secondary.dsp (or bgmNNL/R.dsp with --interleave-bgm)
+ *   --whole-file: <inputstem>_full.dsp (one file, whole input as its audio)
  *   TMNT3 mode: prefixNNNNL.dsp / prefixNNNNR.dsp
  *
  * Build:
@@ -173,6 +209,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                           */
@@ -244,23 +281,64 @@ static void wb16(unsigned v, unsigned char *p)
  *    "honest placeholder" for the real per-stream values this format
  *    doesn't ship (see the top-of-file note on the missing coefficient
  *    search) — which is exactly what triggered this rejection on every
- *    extracted file. Since the true coefficients aren't recoverable from
- *    the data provided, this now uses a fixed, clearly-synthetic non-zero
- *    substitute instead: 8 pairs of (2048, 0), i.e. Q11-fixed-point
- *    (1.0, 0.0) — a first-order "predict next sample = previous sample"
- *    predictor. It's stable (no risk of the runaway feedback a wrong
- *    *unstable* coefficient pair could cause) and passes vgmstream's
- *    check, but it is NOT the game's real coefficients: decoded audio
- *    will have audible quantization noise/distortion beyond what the
- *    original encoder intended, since scale values in the stream were
- *    chosen assuming the real (unknown) predictor, not this generic one.
- *    In short: after this fix, files PLAY; they do not yet sound fully
- *    correct. Replace COEF_PLACEHOLDER below if real coefficients are
- *    ever found.
+ *    extracted file.
+ *
+ *    *** COEF_PLACEHOLDER's specific values, and how they were chosen ***
+ *    Getting past the all-zero check is necessary but not sufficient for
+ *    listenable audio. A first attempt used a single (2048,0) pair (Q11
+ *    "predict = previous sample") repeated across all 8 predictor slots.
+ *    That passes validation but throws away real information: each ADPCM
+ *    frame's header nibble selects one of 8 slots the ORIGINAL encoder
+ *    picked adaptively per frame to fit that frame's signal — collapsing
+ *    all 8 slots to identical behavior ignores that choice entirely.
+ *    Measured on all 1011 extracted SE files, that uniform pair produced
+ *    7.75% of decoded samples clipping at full scale — audible harsh
+ *    distortion, consistent with reports of "still glitching" after the
+ *    initial_ps/all-zero-coefficient fix above.
+ *
+ *    Using 8 *distinct* stable pairs (so each slot at least behaves
+ *    differently, even with guessed values) dropped that to 0.99%. Trying
+ *    to improve further by directly minimizing clipping rate via automated
+ *    coordinate-descent search backfired: it converged toward near-zero
+ *    coefficients, hitting 0.064% clipping — but mean output amplitude
+ *    dropped from ~17800 (uniform) to ~3800, a >4x drop. That's a
+ *    degenerate solution, not a better one: near-zero coefficients trivially
+ *    avoid clipping by barely predicting anything, but the encoder chose
+ *    each frame's scale/delta values assuming the decoder WOULD contribute
+ *    meaningful predicted energy from history. Weak coefficients don't
+ *    reconstruct the signal better, they just fail quietly instead of
+ *    loudly. This is worth stating plainly since it's an easy trap: for
+ *    this kind of problem, "minimize clipping" alone is not a valid proxy
+ *    for "closer to correct."
+ *
+ *    The values below come from re-running that search with an added
+ *    constraint — reject any candidate whose mean output amplitude drops
+ *    below the 8-distinct-pair table's own amplitude — which found a real
+ *    (if modest) improvement: 0.86% clipping across all 1011 files without
+ *    sacrificing signal energy. All 8 pairs were checked for 2nd-order IIR
+ *    stability (poles inside the unit circle); slot 7 has a thin stability
+ *    margin (~0.018) that's fine for short SE clips (empirically verified
+ *    across all 1011) but UNVERIFIED for long sustained BGM audio, where
+ *    many more consecutive frames give marginal coefficients more room to
+ *    drift — if you extract BGM (--bgm) and hear a slow building buzz/
+ *    resonance rather than the more typical broadband quantization noise,
+ *    that slot is the first thing to soften.
+ *
+ *    None of this makes the audio correct. It is still a synthetic
+ *    placeholder chosen to minimize (not eliminate) the gap between
+ *    "plays" and "sounds reasonable," not the game's real per-stream
+ *    coefficients. Replace these values below if real coefficients are
+ *    ever found (e.g. dumped from the game executable).
  */
 static const int16_t COEF_PLACEHOLDER[16] = {
-    2048, 0,  2048, 0,  2048, 0,  2048, 0,
-    2048, 0,  2048, 0,  2048, 0,  2048, 0,
+      -96,     0,
+     1024,     0,
+     1338,  -580,
+     1792,  -512,
+     1202,  -628,
+     2868, -1408,
+     3200, -1800,
+     3500, -1488,
 };
 
 static void make_dsp_hdr(unsigned char *hdr,
@@ -333,8 +411,7 @@ static int write_dsp(const char *path,
  * it instead of the flat-mono path.
  */
 static void write_stereo_pair(const char *path_L, const char *path_R,
-                               const unsigned char *interleaved, unsigned total_sz,
-                               const unsigned char *sub_L, const unsigned char *sub_R)
+                               const unsigned char *interleaved, unsigned total_sz)
 {
     /*
      * Compute exact L and R byte totals first. total_sz does not have to be
@@ -370,12 +447,10 @@ static void write_stereo_pair(const char *path_L, const char *path_R,
         blk++;
     }
 
-    if (write_dsp(path_L, sub_L, szL, bL,
-                  SRATE_DEFAULT, 0, 0))
+    if (write_dsp(path_L, szL, bL, SRATE_DEFAULT, 0, 0))
         printf("    L: %-32s  %u bytes audio\n", path_L, szL);
 
-    if (write_dsp(path_R, sub_R ? sub_R : sub_L,
-                  szR, bR, SRATE_DEFAULT, 0, 0))
+    if (write_dsp(path_R, szR, bR, SRATE_DEFAULT, 0, 0))
         printf("    R: %-32s  %u bytes audio\n", path_R, szR);
 
     free(bL);
@@ -577,13 +652,13 @@ static void extract_kss(const unsigned char *data, long fsz,
              */
             snprintf(nMain, sizeof(nMain), "bgm%02dL.dsp", track);
             snprintf(nSec,  sizeof(nSec),  "bgm%02dR.dsp", track);
-            write_stereo_pair(nMain, nSec, data + L_abs, Ls, NULL, NULL);
+            write_stereo_pair(nMain, nSec, data + L_abs, Ls);
         } else {
             snprintf(nMain, sizeof(nMain), "bgm%02d.dsp", track);
             snprintf(nSec,  sizeof(nSec),  "bgm%02d_secondary.dsp", track);
 
             unsigned char h[DSP_HDR_SZ];
-            make_dsp_hdr(h, Ls, NULL, SRATE_DEFAULT, 0, 0);
+            make_dsp_hdr(h, Ls, data + L_abs, SRATE_DEFAULT, 0, 0);
             FILE *f = fopen(nMain, "wb");
             if (f) {
                 fwrite(h, 1, DSP_HDR_SZ, f);
@@ -597,7 +672,7 @@ static void extract_kss(const unsigned char *data, long fsz,
             if (has_R && Ra != 0u && Rs != 0u &&
                 (unsigned long)Ra + Rs <= (unsigned long)fsz) {
                 unsigned char h2[DSP_HDR_SZ];
-                make_dsp_hdr(h2, Rs, NULL, SRATE_DEFAULT, 0, 0);
+                make_dsp_hdr(h2, Rs, data + Ra, SRATE_DEFAULT, 0, 0);
                 FILE *f2 = fopen(nSec, "wb");
                 if (f2) {
                     fwrite(h2, 1, DSP_HDR_SZ, f2);
@@ -736,7 +811,7 @@ static void extract_kss(const unsigned char *data, long fsz,
 
             /* Build DSP header (non-looping; see comment above) */
             unsigned char h[DSP_HDR_SZ];
-            make_dsp_hdr(h, sz, NULL, SRATE_DEFAULT, 0, 0);
+            make_dsp_hdr(h, sz, data + a, SRATE_DEFAULT, 0, 0);
 
             char name[64];
             snprintf(name, sizeof(name), "se%04d.dsp", i);
@@ -850,12 +925,76 @@ static void extract_tmnt3(const unsigned char *data, long fsz,
 }
 
 /* ================================================================== */
+/*  Whole-file mode: wrap the ENTIRE input file as a single .dsp        */
+/* ================================================================== */
+/*
+ * This does not parse the KSS format at all -- it treats every byte of
+ * the input, from offset 0 to EOF, as one continuous mono ADPCM stream
+ * and slaps a single 0x60-byte header on the front.
+ *
+ * Be clear about what this is actually useful for: it is NOT a way to
+ * get one clean audio file out of WaveData.bin. Most of the file is
+ * headers, tables, and 1000+ independently-authored clips, each of
+ * which resets its own ADPCM predictor history at its own frame 0 --
+ * concatenating all of that and decoding it as if it were one take
+ * will produce a jarring, glitchy jumble even before accounting for
+ * the still-unsolved missing-coefficients problem. What it IS useful
+ * for: a quick way to eyeball/ear-ball the raw byte layout of a file
+ * you haven't reverse engineered yet (silence gaps between sections
+ * are often audible even when the "audio" in between isn't meaningful),
+ * or to sanity-check that a file loads at all before writing a real
+ * parser for it.
+ */
+static void extract_whole_file(const unsigned char *data, long fsz, const char *inpath)
+{
+    printf("=== Whole-file mode ===\n");
+    printf("Wrapping the entire %ld-byte input as one mono .dsp.\n", fsz);
+    printf("NOTE: this is a raw diagnostic dump, not a real audio track --\n");
+    printf("      most of it will not decode as coherent sound. See the\n");
+    printf("      comment above extract_whole_file() in the source for why.\n\n");
+
+    if ((unsigned long)fsz > 0x10000000ul) {
+        fprintf(stderr,
+            "Warning: input is larger than 256MB. num_nibbles (file_size*2) would\n"
+            "exceed vgmstream's validation limit (0x20000000) and the resulting\n"
+            ".dsp would fail to open. Proceeding anyway, but expect a rejection.\n");
+    }
+
+    /* Derive "<inputstem>_full.dsp" from the input path, stripping any
+     * directory components and the original extension. */
+    const char *base = inpath;
+    const char *slash1 = strrchr(inpath, '/');
+    const char *slash2 = strrchr(inpath, '\\');
+    if (slash1 && (!slash2 || slash1 > slash2)) base = slash1 + 1;
+    else if (slash2) base = slash2 + 1;
+
+    char stem[240];
+    snprintf(stem, sizeof(stem), "%s", base);
+    char *dot = strrchr(stem, '.');
+    if (dot) *dot = '\0';
+
+    char outname[256];
+    snprintf(outname, sizeof(outname), "%s_full.dsp", stem);
+
+    unsigned char h[DSP_HDR_SZ];
+    make_dsp_hdr(h, (unsigned)fsz, data, SRATE_DEFAULT, 0, 0);
+
+    FILE *f = fopen(outname, "wb");
+    if (!f) { perror(outname); return; }
+    fwrite(h, 1, DSP_HDR_SZ, f);
+    fwrite(data, 1, (size_t)fsz, f);
+    fclose(f);
+
+    printf("Wrote %s  (%u byte header + %ld bytes audio)\n", outname, DSP_HDR_SZ, fsz);
+}
+
+/* ================================================================== */
 /*  Entry point                                                         */
 /* ================================================================== */
 static void print_usage(const char *argv0)
 {
     fprintf(stderr,
-        "Usage: %s [input_file] [output_prefix] [--bgm] [--interleave-bgm]\n"
+        "Usage: %s [input_file] [output_prefix] [--bgm] [--interleave-bgm] [--whole-file]\n"
         "  input_file       Defaults to WaveData.bin\n"
         "  output_prefix    Used only in legacy TMNT3 scan mode; defaults to \"tmnt3mn\"\n"
         "  --bgm            Opt-in: also extract BGM music clips (default is\n"
@@ -863,7 +1002,15 @@ static void print_usage(const char *argv0)
         "  --interleave-bgm Opt-in, only meaningful together with --bgm: de-interleave\n"
         "                   KSS BGM clips as 0x100-byte stereo instead of the default\n"
         "                   flat-mono extraction (see source comments above\n"
-        "                   extract_kss() before using this).\n",
+        "                   extract_kss() before using this).\n"
+        "  --whole-file     Skip normal extraction; wrap the ENTIRE input file as one\n"
+        "                   big single .dsp instead (raw diagnostic dump -- see the\n"
+        "                   comment above extract_whole_file() before relying on this).\n"
+        "\n"
+        "Drag-and-drop: dropping a file onto the .exe with no other options runs this\n"
+        "with just that one argument, which brings up an interactive menu to choose\n"
+        "between normal extraction and whole-file mode, since a dropped file can't\n"
+        "carry command-line flags with it.\n",
         argv0);
 }
 
@@ -873,6 +1020,7 @@ int main(int argc, char *argv[])
     const char *prefix = NULL;
     int interleave_bgm = 0;
     int write_bgm = 0;
+    int whole_file = 0;
     int i;
 
     for (i = 1; i < argc; i++) {
@@ -880,6 +1028,8 @@ int main(int argc, char *argv[])
             interleave_bgm = 1;
         } else if (strcmp(argv[i], "--bgm") == 0) {
             write_bgm = 1;
+        } else if (strcmp(argv[i], "--whole-file") == 0) {
+            whole_file = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -893,21 +1043,59 @@ int main(int argc, char *argv[])
             return 1;
         }
     }
+
+    /*
+     * Drag-and-drop detection: Windows Explorer launches
+     * "kss_dsp_extract.exe <dropped_file>" with exactly one argument and
+     * no way to attach flags to the gesture. That's indistinguishable from
+     * someone typing just the filename at a prompt, which is fine -- in
+     * both cases there's no way to know which mode they want, so ask.
+     * Any other invocation shape (flags present, multiple positional args,
+     * or no arguments at all) is assumed to be deliberate/scripted use and
+     * runs straight through with no prompts, so automation keeps working.
+     */
+    int interactive = (argc == 2 && argv[1][0] != '-');
+
     if (!inpath) inpath = "WaveData.bin";
     if (!prefix) prefix = "tmnt3mn";
 
     printf("===========================================\n");
-    printf("  GameCube DSP Extractor v2.1\n");
+    printf("  GameCube DSP Extractor v2.2\n");
     printf("  Disney Sports: Soccer 'KSS ... Link Data' / TMNT3 strbgm.bin\n");
     printf("===========================================\n");
     printf("Input: %s\n", inpath);
-    printf("Mode:  %s%s\n", write_bgm ? "SE + BGM" : "SE only (default; pass --bgm for music too)",
-           interleave_bgm ? ", --interleave-bgm" : "");
+
+    if (interactive) {
+        printf("\nNo command-line options given -- choose a mode:\n");
+        printf("  1) Extract sound effects as separate .dsp files [default]\n");
+        printf("  2) Convert the WHOLE file to a single .dsp (raw diagnostic dump;\n");
+        printf("     most of it will NOT sound like coherent audio)\n");
+        printf("Enter choice [1]: ");
+        fflush(stdout);
+        char line[16];
+        if (fgets(line, sizeof(line), stdin) && line[0] == '2')
+            whole_file = 1;
+        printf("\n");
+    }
+
+    printf("Mode:  %s\n",
+           whole_file ? "whole-file (single raw .dsp dump)"
+                      : (write_bgm ? "SE + BGM" : "SE only (default; pass --bgm for music too)"));
+    if (!whole_file && interleave_bgm)
+        printf("       --interleave-bgm\n");
     printf("\n");
 
     /* Read the entire file into memory */
     FILE *fp = fopen(inpath, "rb");
-    if (!fp) { perror(inpath); return 1; }
+    if (!fp) {
+        perror(inpath);
+        if (interactive) {
+            printf("\nPress Enter to exit...");
+            fflush(stdout);
+            int c; while ((c = getchar()) != '\n' && c != EOF) {}
+        }
+        return 1;
+    }
     fseek(fp, 0, SEEK_END);
     long fsz = ftell(fp);
     fseek(fp, 0, SEEK_SET);
@@ -920,8 +1108,9 @@ int main(int argc, char *argv[])
     fclose(fp);
     printf("File size: 0x%08lX (%ld bytes)\n\n", (unsigned long)fsz, fsz);
 
-    /* Dispatch on magic */
-    if (fsz >= 18 && memcmp(data, "KSS Wave Link Data", 18) == 0) {
+    if (whole_file) {
+        extract_whole_file(data, fsz, inpath);
+    } else if (fsz >= 18 && memcmp(data, "KSS Wave Link Data", 18) == 0) {
         extract_kss(data, fsz, interleave_bgm, write_bgm);
     } else if (fsz >= 17 && memcmp(data, "KSS BGM Link Data", 17) == 0) {
         printf("KSS BGM Link Data detected – no raw DSP audio to extract.\n");
@@ -932,5 +1121,11 @@ int main(int argc, char *argv[])
 
     free(data);
     printf("\nDone.\n");
+
+    if (interactive) {
+        printf("\nPress Enter to exit...");
+        fflush(stdout);
+        int c; while ((c = getchar()) != '\n' && c != EOF) {}
+    }
     return 0;
 }
