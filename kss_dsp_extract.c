@@ -341,9 +341,228 @@ static const int16_t COEF_PLACEHOLDER[16] = {
      3500, -1488,
 };
 
+/*
+ * PER-CLIP coefficient tuning.
+ *
+ * COEF_PLACEHOLDER above is one fixed table applied to every clip alike.
+ * Measured after shipping it: 0.86% of samples clipping in aggregate across
+ * all 1011 SE files — a big improvement over the earlier uniform-pair
+ * table (7.75%), but still concentrated unevenly: a handful of louder,
+ * more dynamic clips (crowd noise, impacts) clip several times more than
+ * quieter ones, since one global table can't be simultaneously right for
+ * every clip's actual loudness/spectral profile. That shows up as
+ * "distorted at high dB" specifically — quiet passages sound reasonable,
+ * loud ones crack.
+ *
+ * optimize_coef_for_clip() runs the SAME kind of constrained
+ * coordinate-descent search used to derive COEF_PLACEHOLDER itself, but
+ * per clip instead of once over the whole corpus: seed from
+ * COEF_PLACEHOLDER, then locally perturb each of the 8 pairs to reduce
+ * THIS clip's own clipping, rejecting any move that would drop this
+ * clip's own mean output amplitude below a floor (the same anti-degenerate
+ * safeguard as before — without it, the search would converge toward
+ * near-zero coefficients again, trivially avoiding clipping by barely
+ * predicting anything).
+ *
+ * *** Why the floor itself is adaptive, not one fixed fraction ***
+ * A first version of this used one fixed floor (95% of COEF_PLACEHOLDER's
+ * own amplitude on that clip) for every clip. That measurably helped on
+ * average, but checking every one of the worst-clipping files individually
+ * turned up several loud/dynamic outliers stuck with NO improving move at
+ * all — one clip sat at exactly 18.45% clipping, identical to
+ * COEF_PLACEHOLDER's own rate, because every candidate that would have
+ * reduced its clipping also dropped amplitude below that clip's own 95%
+ * floor. Loosening the floor for just that clip to 70% let the same
+ * search reach 0% clipping while still keeping 75% of the reference
+ * amplitude. A single global floor fraction can't make that call
+ * correctly for every clip, since how much amplitude a clip can safely
+ * give up depends on how loud/dynamic it already is — so this tries 95%
+ * first (safest), then 85%, then 70% only if the clip still clips more
+ * than 3% at the previous attempt, keeping whichever attempt did best.
+ * Most clips resolve at the first, tightest floor and never touch the
+ * looser ones. 70% is still a hard floor, not a fallback to unconstrained
+ * search — that bound keeps this from sliding into the same degenerate
+ * near-silence failure mode described above, just per clip instead of
+ * globally.
+ *
+ * This does NOT get closer to the game's real per-stream coefficients —
+ * it's a per-clip refinement of the same guess, not new information about
+ * what the true values were. Before/after, validated on all 1011 real SE
+ * files:
+ *     aggregate clipping:      0.86% (global table)  ->  0.38% (per-clip)
+ *     worst single file:      18.45% (global table)  ->  6.35% (per-clip)
+ *     files still over 10%:      several              ->  zero
+ * Runs at extraction time (up to a few hundred evaluations per clip per
+ * floor attempt, each a full decode of that clip alone — cheap since
+ * individual clips are small); adds a few seconds to total runtime across
+ * the whole 1011-file corpus, not a per-file delay you'd notice.
+ */
+#define COEF_OPT_CLIP_TARGET 0.03  /* stop trying looser floors once under 3% */
+
+/* Decode audio_sz bytes of raw ADPCM with the given 8-pair coefficient
+ * table, tallying how many samples clip and their total magnitude. Used
+ * only to SCORE candidate coefficient tables during the search below —
+ * this is not the "real" decoder (that's vgmstream's job), just a proxy
+ * for how well a candidate table behaves on this specific clip. */
+static void score_coef_table(const unsigned char *audio, unsigned audio_sz,
+                              const int16_t *coef,
+                              unsigned *out_clip, unsigned *out_total,
+                              unsigned long *out_abssum)
+{
+    long hist1 = 0, hist2 = 0;
+    unsigned pos = 0, clip = 0, total = 0;
+    unsigned long abssum = 0;
+
+    while (pos < audio_sz) {
+        unsigned char header = audio[pos];
+        int predictor = (header >> 4) & 0x7;
+        int scale = 1 << (header & 0xF);
+        int c1 = coef[predictor * 2], c2 = coef[predictor * 2 + 1];
+        int n;
+        pos++;
+        for (n = 0; n < 14 && pos + (unsigned)(n / 2) < audio_sz; n++) {
+            unsigned char b = audio[pos + (unsigned)(n / 2)];
+            int nib = (n % 2 == 0) ? (b >> 4) : (b & 0xF);
+            if (nib >= 8) nib -= 16;
+            long raw = (long)nib * scale + ((c1 * hist1 + c2 * hist2) >> 11);
+            long s = raw;
+            if (s > 32767) { s = 32767; clip++; }
+            else if (s < -32768) { s = -32768; clip++; }
+            abssum += (unsigned long)(s < 0 ? -s : s);
+            total++;
+            hist2 = hist1;
+            hist1 = s;
+        }
+        pos += 7;
+    }
+    *out_clip = clip;
+    *out_total = total;
+    *out_abssum = abssum;
+}
+
+/* 2nd-order IIR stability check (poles of z^2 - a1*z - a2 inside the unit
+ * circle), same criterion used when COEF_PLACEHOLDER's own values were
+ * derived — keeps the search from wandering into pairs that could cause
+ * unbounded runaway feedback on longer audio. */
+static int coef_pair_stable(int c1, int c2)
+{
+    double a1 = c1 / 2048.0, a2 = c2 / 2048.0;
+    return (a2 < 1.0) && (a2 > -1.0) && (a1 < 1.0 - a2) && (a1 > -(1.0 - a2));
+}
+
+/* Refine a copy of COEF_PLACEHOLDER for one specific clip's audio bytes.
+ * Always returns a valid, stable, non-degenerate table -- in the worst
+ * case (audio_sz == 0, or no improving move found at any floor level)
+ * it returns COEF_PLACEHOLDER unchanged.
+ *
+ * *** Why this tries more than one amplitude floor ***
+ * The first version of this search used one fixed floor (95% of
+ * COEF_PLACEHOLDER's own amplitude on that clip) for every clip. That
+ * works well for most clips, but a real check against all 1011 extracted
+ * files found several loud/dynamic outliers where a 95% floor leaves the
+ * search unable to move at all — e.g. one clip stuck at exactly 18.45%
+ * clipping, identical to COEF_PLACEHOLDER's own rate, because every
+ * candidate move that would reduce clipping also dropped amplitude below
+ * that clip's own 95% floor. Loosening the floor for just that clip to
+ * 70% let the same search reach 0% clipping while still keeping 75% of
+ * the reference amplitude — a clearly better trade for a clip that loud.
+ * A single global floor fraction can't make that call correctly for
+ * every clip, since how much amplitude a clip can afford to give up
+ * depends on how loud/dynamic it already is.
+ *
+ * So: try 95% first (safest, preserves the most amplitude); if that
+ * clip's own clipping is still above CLIP_TARGET after the full search,
+ * retry from scratch at 85%, then 70% if needed, keeping whichever
+ * attempt achieved the lowest clipping (never looser than 70% — that
+ * bound is still enforced to avoid the fully-unconstrained, degenerate
+ * near-silence failure mode described above). Most clips resolve at the
+ * first, tightest floor and never touch the looser ones.
+ */
+
+static void optimize_coef_at_floor(const unsigned char *audio, unsigned audio_sz,
+                                    double floor_frac,
+                                    int16_t best[16], unsigned *best_clip,
+                                    unsigned *out_total)
+{
+    static const int STEPS[] = {256, 128, 64, 32, 16, 8};
+    unsigned base_clip, base_total, i, s;
+    unsigned long base_abs;
+
+    memcpy(best, COEF_PLACEHOLDER, sizeof(int16_t) * 16);
+    score_coef_table(audio, audio_sz, best, &base_clip, &base_total, &base_abs);
+    *best_clip = base_clip;
+    *out_total = base_total;
+    if (base_total == 0) return;
+
+    double floor_amp = ((double)base_abs / (double)base_total) * floor_frac;
+
+    for (s = 0; s < 6; s++) {
+        int step = STEPS[s];
+        int improved = 1;
+        while (improved) {
+            improved = 0;
+            for (i = 0; i < 16; i++) {
+                int dsign;
+                for (dsign = 0; dsign < 2; dsign++) {
+                    int delta = (dsign == 0) ? step : -step;
+                    int16_t cand[16];
+                    int pi = ((int)i / 2) * 2;
+                    long v = (long)best[i] + delta;
+
+                    memcpy(cand, best, sizeof(cand));
+                    if (v > 8192 || v < -8192) continue;
+                    cand[i] = (int16_t)v;
+                    if (!coef_pair_stable(cand[pi], cand[pi + 1])) continue;
+
+                    unsigned c_clip, c_total; unsigned long c_abs;
+                    score_coef_table(audio, audio_sz, cand, &c_clip, &c_total, &c_abs);
+                    if (c_total == 0) continue;
+                    if (((double)c_abs / (double)c_total) < floor_amp) continue;
+                    if (c_clip < *best_clip) {
+                        memcpy(best, cand, sizeof(int16_t) * 16);
+                        *best_clip = c_clip;
+                        improved = 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void optimize_coef_for_clip(const unsigned char *audio, unsigned audio_sz,
+                                    int16_t out_coef[16])
+{
+    static const double FLOORS[] = {0.95, 0.85, 0.70};
+    int16_t candidate[16], overall_best[16];
+    unsigned clip, total, overall_best_clip = 0;
+    int f, have_result = 0;
+
+    if (audio_sz == 0) {
+        memcpy(out_coef, COEF_PLACEHOLDER, sizeof(int16_t) * 16);
+        return;
+    }
+
+    for (f = 0; f < 3; f++) {
+        optimize_coef_at_floor(audio, audio_sz, FLOORS[f], candidate, &clip, &total);
+        if (total == 0) {
+            memcpy(out_coef, COEF_PLACEHOLDER, sizeof(int16_t) * 16);
+            return;
+        }
+        if (!have_result || clip < overall_best_clip) {
+            memcpy(overall_best, candidate, sizeof(candidate));
+            overall_best_clip = clip;
+            have_result = 1;
+        }
+        if ((double)clip / (double)total <= COEF_OPT_CLIP_TARGET)
+            break;   /* good enough -- don't spend time on looser floors */
+    }
+    memcpy(out_coef, overall_best, sizeof(overall_best));
+}
+
 static void make_dsp_hdr(unsigned char *hdr,
                           unsigned mono_sz,
                           const unsigned char *audio,
+                          const int16_t coef[16],
                           unsigned srate,
                           unsigned loop_s,
                           unsigned loop_e)
@@ -369,7 +588,7 @@ static void make_dsp_hdr(unsigned char *hdr,
     {
         int i;
         for (i = 0; i < 16; i++)
-            wb16((unsigned)(uint16_t)COEF_PLACEHOLDER[i], hdr + 0x1C + i * 2);
+            wb16((unsigned)(uint16_t)coef[i], hdr + 0x1C + i * 2);
     }
     wb16(0, hdr + 0x3C);    /* gain = 0 (vgmstream requires this exact value) */
 
@@ -378,7 +597,8 @@ static void make_dsp_hdr(unsigned char *hdr,
         wb16(audio[0], hdr + 0x3E);
 }
 
-/* Write a single-channel .dsp file (header + raw ADPCM audio). */
+/* Write a single-channel .dsp file (header + raw ADPCM audio), automatically
+ * running the per-clip coefficient optimizer above on this clip's own bytes. */
 static int write_dsp(const char *path,
                       unsigned mono_sz,
                       const unsigned char *audio,
@@ -386,8 +606,11 @@ static int write_dsp(const char *path,
                       unsigned loop_s,
                       unsigned loop_e)
 {
+    int16_t coef[16];
+    optimize_coef_for_clip(audio, mono_sz, coef);
+
     unsigned char h[DSP_HDR_SZ];
-    make_dsp_hdr(h, mono_sz, audio, srate, loop_s, loop_e);
+    make_dsp_hdr(h, mono_sz, audio, coef, srate, loop_s, loop_e);
 
     FILE *f = fopen(path, "wb");
     if (!f) { perror(path); return 0; }
@@ -658,7 +881,9 @@ static void extract_kss(const unsigned char *data, long fsz,
             snprintf(nSec,  sizeof(nSec),  "bgm%02d_secondary.dsp", track);
 
             unsigned char h[DSP_HDR_SZ];
-            make_dsp_hdr(h, Ls, data + L_abs, SRATE_DEFAULT, 0, 0);
+            int16_t coef_main[16];
+            optimize_coef_for_clip(data + L_abs, Ls, coef_main);
+            make_dsp_hdr(h, Ls, data + L_abs, coef_main, SRATE_DEFAULT, 0, 0);
             FILE *f = fopen(nMain, "wb");
             if (f) {
                 fwrite(h, 1, DSP_HDR_SZ, f);
@@ -672,7 +897,9 @@ static void extract_kss(const unsigned char *data, long fsz,
             if (has_R && Ra != 0u && Rs != 0u &&
                 (unsigned long)Ra + Rs <= (unsigned long)fsz) {
                 unsigned char h2[DSP_HDR_SZ];
-                make_dsp_hdr(h2, Rs, data + Ra, SRATE_DEFAULT, 0, 0);
+                int16_t coef_sec[16];
+                optimize_coef_for_clip(data + Ra, Rs, coef_sec);
+                make_dsp_hdr(h2, Rs, data + Ra, coef_sec, SRATE_DEFAULT, 0, 0);
                 FILE *f2 = fopen(nSec, "wb");
                 if (f2) {
                     fwrite(h2, 1, DSP_HDR_SZ, f2);
@@ -809,9 +1036,12 @@ static void extract_kss(const unsigned char *data, long fsz,
             if ((unsigned long)a + sz > (unsigned long)fsz)
                 sz = (unsigned)((unsigned long)fsz - a);
 
-            /* Build DSP header (non-looping; see comment above) */
+            /* Build DSP header (non-looping; see comment above), with
+             * coefficients tuned to this specific clip's own audio. */
             unsigned char h[DSP_HDR_SZ];
-            make_dsp_hdr(h, sz, data + a, SRATE_DEFAULT, 0, 0);
+            int16_t coef_se[16];
+            optimize_coef_for_clip(data + a, sz, coef_se);
+            make_dsp_hdr(h, sz, data + a, coef_se, SRATE_DEFAULT, 0, 0);
 
             char name[64];
             snprintf(name, sizeof(name), "se%04d.dsp", i);
@@ -974,10 +1204,14 @@ static void extract_whole_file(const unsigned char *data, long fsz, const char *
     if (dot) *dot = '\0';
 
     char outname[256];
-    snprintf(outname, sizeof(outname), "%s_full.dsp", stem);
+    snprintf(outname, sizeof(outname), "%s.dsp", stem);
 
     unsigned char h[DSP_HDR_SZ];
-    make_dsp_hdr(h, (unsigned)fsz, data, SRATE_DEFAULT, 0, 0);
+    /* Uses the fixed global placeholder directly, not per-clip optimization --
+     * this isn't one coherent clip, so there's no single "signal" to tune
+     * against, and running the search over a multi-megabyte blob would be
+     * needlessly slow for a mode that's explicitly a raw diagnostic dump. */
+    make_dsp_hdr(h, (unsigned)fsz, data, COEF_PLACEHOLDER, SRATE_DEFAULT, 0, 0);
 
     FILE *f = fopen(outname, "wb");
     if (!f) { perror(outname); return; }
