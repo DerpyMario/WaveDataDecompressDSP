@@ -63,6 +63,7 @@ jobs:
         if (Test-Path "$mingwPath\libstdc++-6.dll") {
           Copy-Item "$mingwPath\libstdc++-6.dll" .
           Copy-Item "$mingwPath\libgcc_s_seh-1.dll" .
+          Copy-Item "$mingwPath\libwinpthread-1.dll" .
           Write-Output "Copied DLLs from $mingwPath"
         } else {
           # Fallback: use gcc to find the DLL path
@@ -72,6 +73,7 @@ jobs:
             if (Test-Path "$gccDir\libstdc++-6.dll") {
               Copy-Item "$gccDir\libstdc++-6.dll" .
               Copy-Item "$gccDir\libgcc_s_seh-1.dll" .
+              Copy-Item "$gccDir\libwinpthread-1.dll" .
               Write-Output "Copied DLLs from $gccDir"
             }
           }
@@ -86,4 +88,5 @@ jobs:
           GBA Sappy to MIDI*
           libstdc++-6.dll
           libgcc_s_seh-1.dll
-        retention-days: 50
+          libwinpthread-1.dll
+        retention-days: 30
