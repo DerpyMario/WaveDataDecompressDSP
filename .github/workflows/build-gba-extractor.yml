@@ -1,4 +1,4 @@
-name: Build GBA Sample Extractor
+name: Build GBA Extractors
 
 on:
   push:
@@ -7,40 +7,57 @@ on:
       - 'gba_sample_extract_v1.cpp'
       - 'gba_sappy_to_midi.cpp'
       - '.github/workflows/build-gba-extractor.yml'
-  pull_request:
-    branches: [ main, master, develop ]
-    paths:
-      - 'gba_sample_extract_v1.cpp'
-      - 'gba_sappy_to_midi.cpp'
-      - '.github/workflows/build-gba-extractor.yml'
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ ubuntu-latest, windows-latest, macos-latest ]
+    runs-on: ${{ matrix.os }}
 
     steps:
     - uses: actions/checkout@v3
 
-    - name: Install dependencies
+    - name: Set up build tools (Ubuntu)
+      if: runner.os == 'Linux'
       run: sudo apt-get update && sudo apt-get install -y build-essential g++
 
+    - name: Set executable names
+      id: names
+      shell: bash
+      run: |
+        if [ "${{ runner.os }}" == "Windows" ]; then
+          echo "exe_ext=.exe" >> $GITHUB_OUTPUT
+        else
+          echo "exe_ext=" >> $GITHUB_OUTPUT
+        fi
+
     - name: Build GBA Sample Extractor
-      run: g++ -O2 -std=c++17 -o "GBA Sample Extractor" gba_sample_extract_v1.cpp
+      run: g++ -O2 -std=c++17 -o "GBA Sample Extractor${{ steps.names.outputs.exe_ext }}" gba_sample_extract_v1.cpp
 
     - name: Build GBA Sappy to MIDI
-      run: g++ -O2 -std=c++17 -o "GBA Sappy to MIDI" gba_sappy_to_midi.cpp
+      run: g++ -O2 -std=c++17 -o "GBA Sappy to MIDI${{ steps.names.outputs.exe_ext }}" gba_sappy_to_midi.cpp
 
-    - name: Verify executables
+    - name: Verify executables (Unix)
+      if: runner.os != 'Windows'
       run: |
         ls -lh "GBA Sample Extractor" "GBA Sappy to MIDI"
         ./"GBA Sample Extractor" --help
         ./"GBA Sappy to MIDI" --help 2>&1 || true
 
+    - name: Verify executables (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        ls -lh "GBA Sample Extractor.exe" "GBA Sappy to MIDI.exe"
+        "./GBA Sample Extractor.exe" --help
+        "./GBA Sappy to MIDI.exe" --help 2>&1 || true
+
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v3
       with:
-        name: GBA-Extractors-Linux
+        name: GBA-Extractors-${{ runner.os }}
         path: |
-          GBA Sample Extractor
-          GBA Sappy to MIDI
-        retention-days: 50
+          GBA Sample Extractor*
+          GBA Sappy to MIDI*
+        retention-days: 30
