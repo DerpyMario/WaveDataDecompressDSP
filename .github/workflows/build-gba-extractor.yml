@@ -47,11 +47,12 @@ jobs:
 
     - name: Verify executables (Windows)
       if: runner.os == 'Windows'
-      shell: bash
+      shell: pwsh
       run: |
-        ls -lh "GBA Sample Extractor.exe" "GBA Sappy to MIDI.exe"
-        "./GBA Sample Extractor.exe" --help
-        "./GBA Sappy to MIDI.exe" --help 2>&1 || true
+        ls "GBA Sample Extractor.exe" | Format-List Length, Name
+        ls "GBA Sappy to MIDI.exe" | Format-List Length, Name
+        & ".\GBA Sample Extractor.exe" --help
+        & ".\GBA Sappy to MIDI.exe" --help
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
