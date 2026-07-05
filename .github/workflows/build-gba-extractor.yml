@@ -37,10 +37,10 @@ jobs:
         ./"GBA Sappy to MIDI" --help 2>&1 || true
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: GBA-Extractors-Linux
         path: |
           GBA Sample Extractor
           GBA Sappy to MIDI
-        retention-days: 60
+        retention-days: 50
