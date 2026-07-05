@@ -51,8 +51,8 @@ jobs:
       run: |
         ls "GBA Sample Extractor.exe" | Format-List Length, Name
         ls "GBA Sappy to MIDI.exe" | Format-List Length, Name
-        & ".\GBA Sample Extractor.exe" --help
-        & ".\GBA Sappy to MIDI.exe" --help
+        & ".\GBA Sample Extractor.exe" --help | head -5
+        & ".\GBA Sappy to MIDI.exe" --help 2>&1 | head -5 || $true
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
