@@ -1,0 +1,38 @@
+name: Build GBA Sample Extractor
+
+on:
+  push:
+    branches: [ main, master, develop ]
+    paths:
+      - 'gba_sample_extract_v1.cpp'
+      - '.github/workflows/build-gba-extractor.yml'
+  pull_request:
+    branches: [ main, master, develop ]
+    paths:
+      - 'gba_sample_extract_v1.cpp'
+      - '.github/workflows/build-gba-extractor.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y build-essential g++
+
+    - name: Build GBA Sample Extractor
+      run: g++ -O2 -std=c++17 -o "GBA Sample Extractor" gba_sample_extract_v1.cpp
+
+    - name: Verify executable
+      run: |
+        ls -lh "GBA Sample Extractor"
+        ./"GBA Sample Extractor" --help
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: GBA-Sample-Extractor-Linux
+        path: GBA Sample Extractor
+        retention-days: 30
