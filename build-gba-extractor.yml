@@ -5,11 +5,13 @@ on:
     branches: [ main, master, develop ]
     paths:
       - 'gba_sample_extract_v1.cpp'
+      - 'gba_sappy_to_midi.cpp'
       - '.github/workflows/build-gba-extractor.yml'
   pull_request:
     branches: [ main, master, develop ]
     paths:
       - 'gba_sample_extract_v1.cpp'
+      - 'gba_sappy_to_midi.cpp'
       - '.github/workflows/build-gba-extractor.yml'
 
 jobs:
@@ -25,14 +27,20 @@ jobs:
     - name: Build GBA Sample Extractor
       run: g++ -O2 -std=c++17 -o "GBA Sample Extractor" gba_sample_extract_v1.cpp
 
-    - name: Verify executable
-      run: |
-        ls -lh "GBA Sample Extractor"
-        ./"GBA Sample Extractor" --help
+    - name: Build GBA Sappy to MIDI
+      run: g++ -O2 -std=c++17 -o "GBA Sappy to MIDI" gba_sappy_to_midi.cpp
 
-    - name: Upload artifact
+    - name: Verify executables
+      run: |
+        ls -lh "GBA Sample Extractor" "GBA Sappy to MIDI"
+        ./"GBA Sample Extractor" --help
+        ./"GBA Sappy to MIDI" --help 2>&1 || true
+
+    - name: Upload artifacts
       uses: actions/upload-artifact@v3
       with:
-        name: GBA-Sample-Extractor-Linux
-        path: GBA Sample Extractor
-        retention-days: 30
+        name: GBA-Extractors-Linux
+        path: |
+          GBA Sample Extractor
+          GBA Sappy to MIDI
+        retention-days: 60
