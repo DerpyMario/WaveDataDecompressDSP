@@ -5,8 +5,7 @@ on:
     paths:
       - 'kss_dsp_extract.c'
       - 'pactool.c'
-      - '.github/workflows/**'
-  pull_request:
+      - '.github/workflows/build-windows-exe.yml'
 
 jobs:
   build:
